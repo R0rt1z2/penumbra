@@ -2,7 +2,10 @@
     SPDX-License-Identifier: AGPL-3.0-or-later
     SPDX-FileCopyrightText: 2025 Shomy
 */
+use std::time::Duration;
+
 use log::{error, info};
+use tokio::time::timeout;
 
 use crate::connection::Connection;
 use crate::connection::port::{ConnectionType, MTKPort};
@@ -10,7 +13,7 @@ use crate::core::crypto::config::{CryptoConfig, CryptoIO};
 use crate::core::crypto::sej::SEJCrypto;
 use crate::core::devinfo::{DevInfoData, DeviceInfo};
 use crate::core::seccfg::{LockFlag, SecCfgV4};
-use crate::core::storage::{PartitionKind, parse_gpt};
+use crate::core::storage::{Partition, PartitionKind, parse_gpt};
 use crate::da::{DAFile, DAProtocol, DAType, XFlash};
 use crate::error::{Error, Result};
 
@@ -56,17 +59,14 @@ impl DeviceBuilder {
 
     /// Builds and returns a new `Device` instance.
     pub fn build(self) -> Result<Device> {
-        let connection = match self.mtk_port {
-            Some(port) => Some(Connection::new(port)),
-            None => None,
-        };
+        let connection = self.mtk_port.map(Connection::new);
 
         if connection.is_none() {
             return Err(Error::penumbra("MTK port must be provided to build a Device."));
         }
 
         Ok(Device {
-            dev_info: DeviceInfo::new(),
+            dev_info: DeviceInfo::default(),
             connection,
             protocol: None,
             connected: false,
@@ -129,30 +129,55 @@ impl Device {
         let device_info = DevInfoData {
             soc_id,
             meid,
-            hw_code: hw_code as u16,
+            hw_code,
             chipset: String::from("Unknown"),
             storage: None,
             partitions: vec![],
             target_config,
         };
 
-        if let Some(da_data) = &self.da_data {
-            let da_file = DAFile::parse_da(da_data)?;
-            let da = da_file.get_da_from_hw_code(hw_code as u16).ok_or_else(|| {
-                Error::penumbra(format!("No compatible DA for hardware code 0x{:04X}", hw_code))
-            })?;
+        self.dev_info.set_data(device_info).await;
 
-            let protocol: Box<dyn DAProtocol + Send> = match da.da_type {
-                DAType::V5 => Box::new(XFlash::new(conn, da, self.dev_info.clone())),
-                _ => return Err(Error::penumbra("Unsupported DA type")),
-            };
-
-            self.protocol = Some(protocol);
+        if self.da_data.is_some() {
+            self.protocol = Some(self.init_da_protocol(conn, true).await?);
+            self.get_partitions().await;
         } else {
             self.connection = Some(conn);
         }
 
-        self.dev_info.set_data(device_info).await;
+        self.connected = true;
+
+        Ok(())
+    }
+
+    /// Reinits the device connection based on the current connection type and optional DA info.
+    /// This is useful for CLIs or scenarios where the Device instance needs to be reset.
+    pub async fn reinit(&mut self, dev_info: DevInfoData) -> Result<()> {
+        let mut conn = self
+            .connection
+            .take()
+            .ok_or_else(|| Error::penumbra("Connection is not initialized."))?;
+
+        self.dev_info.set_data(dev_info).await;
+
+        match conn.connection_type {
+            ConnectionType::Preloader | ConnectionType::Brom => {
+                // If we already are in preloader/brom mode, we either handshake again or timeout
+                let handshake_result = timeout(Duration::from_secs(3), conn.handshake()).await;
+                match handshake_result {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(Error::conn(
+                            "Handshake timed out. Reset the device and try again.",
+                        ));
+                    }
+                }
+            }
+            ConnectionType::Da => {
+                self.protocol = Some(self.init_da_protocol(conn, false).await?);
+            }
+        };
+
         self.connected = true;
 
         Ok(())
@@ -180,30 +205,15 @@ impl Device {
             return Err(Error::conn("Device is not connected. Call init() first."));
         }
 
-        let protocol = self.protocol.as_mut().ok_or_else(|| {
-            Error::conn("DA protocol is not initialized. DA data might be missing.")
-        })?;
+        if self.protocol.is_none() {
+            let conn =
+                self.connection.take().ok_or_else(|| Error::conn("No connection available."))?;
+            let protocol = self.init_da_protocol(conn, true).await?;
+            self.protocol = Some(protocol);
+        }
 
-        match protocol.upload_da().await {
-            Ok(_) => info!("Successfully entered DA mode."),
-            Err(e) => Err(Error::proto(format!("Failed to enter DA mode: {}", e)))?,
-        };
-
-        protocol.set_connection_type(ConnectionType::Da)?;
-
-        let storage_type = protocol.get_storage_type().await;
-        let storage = protocol.get_storage().await;
-        let user_section = match storage.as_ref() {
-            Some(s) => s.get_user_part(),
-            None => return Err(Error::proto("Failed to get storage information.")),
-        };
-
-        let mut progress = |_read: usize, _total: usize| {};
-        let pgpt_data = protocol.read_flash(0x0, 0x8000, user_section, &mut progress).await?;
-        let partitions = parse_gpt(&pgpt_data, storage_type)?;
-
-        self.dev_info.set_partitions(partitions).await;
-
+        // Fallback to ensure we always have the partitions available.
+        self.get_partitions().await;
         Ok(())
     }
 
@@ -225,6 +235,34 @@ impl Device {
         Ok(self.get_protocol().unwrap())
     }
 
+    async fn init_da_protocol(
+        &mut self,
+        conn: Connection,
+        upload_da: bool,
+    ) -> Result<Box<dyn DAProtocol + Send>> {
+        let da_bytes = self.da_data.clone().ok_or_else(|| {
+            Error::conn("DA protocol is not initialized and no DA file was provided.")
+        })?;
+
+        let da_file = DAFile::parse_da(&da_bytes)?;
+        let hw_code = self.dev_info.hw_code().await;
+        let da = da_file.get_da_from_hw_code(hw_code).ok_or_else(|| {
+            Error::penumbra(format!("No compatible DA for hardware code 0x{:04X}", hw_code))
+        })?;
+
+        let mut protocol: Box<dyn DAProtocol + Send> = match da.da_type {
+            DAType::V5 => Box::new(XFlash::new(conn, da, self.dev_info.clone())),
+            _ => return Err(Error::penumbra("Unsupported DA type")),
+        };
+
+        if upload_da {
+            protocol.set_connection_type(ConnectionType::Da)?;
+            protocol.upload_da().await?;
+        }
+
+        Ok(protocol)
+    }
+
     /// Gets a mutable reference to the active connection.
     /// If the device is in DA mode, it retrieves the connection from the DA protocol.
     pub fn get_connection(&mut self) -> Result<&mut Connection> {
@@ -235,10 +273,54 @@ impl Device {
         }
     }
 
+    /// Sets the connection type of the active connection.
+    /// Note that this does not change the actual connection state, only the type metadata.
+    /// This is mainly used for reinitialization after entering DA mode.
+    pub fn set_connection_type(&mut self, conn_type: ConnectionType) -> Result<()> {
+        let conn = self.get_connection()?;
+        conn.connection_type = conn_type;
+        Ok(())
+    }
+
     /// Gets a mutable reference to the DA protocol handler, if available.
     /// Returns `None` if the device is not in DA mode.
     pub fn get_protocol(&mut self) -> Option<&mut Box<dyn DAProtocol + Send>> {
         self.protocol.as_mut()
+    }
+
+    pub async fn get_partitions(&mut self) -> Vec<Partition> {
+        let cached = self.dev_info.partitions().await;
+        if !cached.is_empty() {
+            return cached;
+        }
+
+        let protocol = match self.get_protocol() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        let storage_type = protocol.get_storage_type().await;
+        let storage = match protocol.get_storage().await {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        let user_section = storage.get_user_part();
+
+        let mut progress = |_read: usize, _total: usize| {};
+        let pgpt_data = match protocol.read_flash(0x0, 0x8000, user_section, &mut progress).await {
+            Ok(data) => data,
+            Err(_) => return Vec::new(),
+        };
+
+        let partitions = match parse_gpt(&pgpt_data, storage_type) {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+
+        self.dev_info.set_partitions(partitions.clone()).await;
+
+        partitions
     }
 
     /// Reads data from a specified partition on the device.

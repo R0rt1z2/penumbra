@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use crate::core::storage::{Partition, Storage};
 
 /// Safe wrapper around device information with async read/write access.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DeviceInfo {
     inner: Arc<RwLock<DevInfoData>>,
 }
