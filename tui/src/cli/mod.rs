@@ -17,7 +17,7 @@ use clap::{CommandFactory, Parser};
 use log::info;
 use penumbra::connection::port::ConnectionType;
 use penumbra::core::devinfo::DevInfoData;
-use penumbra::{Device, DeviceBuilder, find_mtk_port};
+use penumbra::{Device, DeviceBuilder, PortFilter, find_mtk_port};
 use tokio::fs::read;
 
 use crate::cli::commands::*;
@@ -39,6 +39,9 @@ pub struct CliArgs {
     /// The preloader file to use
     #[arg(short, long = "pl", value_name = "PRELOADER_FILE")]
     pub preloader_file: Option<PathBuf>,
+    /// Filter to a specific USB device by VID:PID
+    #[arg(long, value_name = "VID:PID", value_parser = parse_port_filter)]
+    pub port: Option<PortFilter>,
     /// Subcommands for CLI mode. If provided, TUI mode will be disabled.
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -58,6 +61,10 @@ mtk_commands! {
     Shutdown(ShutdownArgs),
     Reboot(RebootArgs),
     XFlash(XFlashArgs),
+}
+
+fn parse_port_filter(s: &str) -> std::result::Result<PortFilter, String> {
+    s.parse()
 }
 
 #[async_trait]
@@ -107,7 +114,7 @@ pub async fn run_cli(args: &CliArgs) -> Result<()> {
 
     info!("Waiting for MTK device...");
     let mtk_port = loop {
-        if let Some(port) = find_mtk_port().await {
+        if let Some(port) = find_mtk_port(args.port.as_ref()).await {
             info!("Found MTK port: {}", port.get_port_name());
             break port;
         } else if last_seen.elapsed() > timeout {

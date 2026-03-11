@@ -409,7 +409,7 @@ impl DevicePage {
 
         spawn(async move {
             let port = loop {
-                match find_mtk_port().await {
+                match find_mtk_port(None).await {
                     Some(p) => break p,
                     None => sleep(Duration::from_millis(700)).await,
                 }

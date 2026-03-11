@@ -8,14 +8,10 @@ use std::time::Duration;
 use log::{error, info};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::{
-    SerialPort,
-    SerialPortBuilderExt,
-    SerialPortInfo,
-    SerialPortType,
-    SerialStream,
+    SerialPort, SerialPortBuilderExt, SerialPortInfo, SerialPortType, SerialStream,
 };
 
-use crate::connection::port::{ConnectionType, KNOWN_PORTS, MTKPort};
+use crate::connection::port::{ConnectionType, KNOWN_PORTS, MTKPort, PortFilter};
 use crate::error::{Error, Result};
 
 #[derive(Debug)]
@@ -169,16 +165,22 @@ impl MTKPort for SerialMTKPort {
         self.port_info.port_name.clone()
     }
 
-    async fn find_device() -> Result<Option<Self>> {
+    async fn find_device(filter: Option<&PortFilter>) -> Result<Option<Self>> {
         use serialport::{SerialPortType, available_ports};
 
         let serial_ports = match available_ports() {
             Ok(ports) => ports
                 .into_iter()
                 .filter(|p| match &p.port_type {
-                    SerialPortType::UsbPort(usb_info) => KNOWN_PORTS
-                        .iter()
-                        .any(|(vid, pid, _)| usb_info.vid == *vid && usb_info.pid == *pid),
+                    SerialPortType::UsbPort(usb_info) => {
+                        if let Some(f) = filter {
+                            usb_info.vid == f.vid && usb_info.pid == f.pid
+                        } else {
+                            KNOWN_PORTS
+                                .iter()
+                                .any(|(vid, pid, _)| usb_info.vid == *vid && usb_info.pid == *pid)
+                        }
+                    }
                     _ => false,
                 })
                 .collect::<Vec<_>>(),
@@ -189,7 +191,19 @@ impl MTKPort for SerialMTKPort {
         };
 
         for port_info in serial_ports {
-            if let Some(port) = SerialMTKPort::from_port_info(port_info) {
+            if let Some(port) = if filter.is_some() {
+                let SerialPortType::UsbPort(ref usb_info) = port_info.port_type else {
+                    continue;
+                };
+                let conn_type = filter.unwrap().connection_type();
+                let baudrate = match conn_type {
+                    ConnectionType::Brom => 115_200,
+                    ConnectionType::Preloader | ConnectionType::Da => 921_600,
+                };
+                Some(SerialMTKPort::new(port_info, baudrate, conn_type))
+            } else {
+                SerialMTKPort::from_port_info(port_info)
+            } {
                 return Ok(Some(port));
             }
         }

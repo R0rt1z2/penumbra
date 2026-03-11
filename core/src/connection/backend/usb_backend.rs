@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::MTKPort;
 use crate::connection::ConnectionType;
-use crate::connection::port::KNOWN_PORTS;
+use crate::connection::port::{KNOWN_PORTS, PortFilter};
 use crate::error::{Error, Result};
 
 const MAX_TIMEOUT: Duration = Duration::from_secs(2);
@@ -265,16 +265,26 @@ impl MTKPort for UsbMTKPort {
         format!("USB {:04X}:{:04X}", self.info.vendor_id(), self.info.product_id())
     }
 
-    async fn find_device() -> Result<Option<Self>> {
+    async fn find_device(filter: Option<&PortFilter>) -> Result<Option<Self>> {
         let devices = nusb::list_devices().await?;
 
         for device in devices {
-            if let Some((_, _, conn_type)) = KNOWN_PORTS
-                .iter()
-                .find(|(vid, pid, _)| device.vendor_id() == *vid && device.product_id() == *pid)
-            {
-                return Ok(Some(UsbMTKPort::new(device, *conn_type)));
-            }
+            let vid = device.vendor_id();
+            let pid = device.product_id();
+
+            let conn_type = if let Some(f) = filter {
+                if vid != f.vid || pid != f.pid {
+                    continue;
+                }
+                f.connection_type()
+            } else {
+                match KNOWN_PORTS.iter().find(|(kvid, kpid, _)| *kvid == vid && *kpid == pid) {
+                    Some((_, _, ct)) => *ct,
+                    None => continue,
+                }
+            };
+
+            return Ok(Some(UsbMTKPort::new(device, conn_type)));
         }
 
         Ok(None)

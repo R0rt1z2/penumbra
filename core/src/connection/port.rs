@@ -4,6 +4,7 @@
 */
 
 use std::fmt::Debug;
+use std::str::FromStr;
 
 use crate::connection::backend::*;
 use crate::error::Result;
@@ -34,6 +35,41 @@ pub enum ConnectionType {
     Da,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PortFilter {
+    pub vid: u16,
+    pub pid: u16,
+}
+
+impl PortFilter {
+    pub fn new(vid: u16, pid: u16) -> Self {
+        Self { vid, pid }
+    }
+
+    pub fn connection_type(&self) -> ConnectionType {
+        KNOWN_PORTS
+            .iter()
+            .find(|(vid, pid, _)| *vid == self.vid && *pid == self.pid)
+            .map(|(_, _, ct)| *ct)
+            .unwrap_or(ConnectionType::Brom)
+    }
+}
+
+impl FromStr for PortFilter {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let (vid_str, pid_str) = s.split_once(':').ok_or_else(|| {
+            format!("Invalid port format '{s}', expected VID:PID (e.g. 0FCE:D1EC)")
+        })?;
+        let vid = u16::from_str_radix(vid_str, 16)
+            .map_err(|_| format!("Invalid VID '{vid_str}', expected hex"))?;
+        let pid = u16::from_str_radix(pid_str, 16)
+            .map_err(|_| format!("Invalid PID '{pid_str}', expected hex"))?;
+        Ok(PortFilter { vid, pid })
+    }
+}
+
 #[async_trait::async_trait]
 pub trait MTKPort: Send + Debug {
     async fn open(&mut self) -> Result<()>;
@@ -47,7 +83,7 @@ pub trait MTKPort: Send + Debug {
     fn get_baudrate(&self) -> u32;
     fn get_port_name(&self) -> String;
 
-    async fn find_device() -> Result<Option<Self>>
+    async fn find_device(filter: Option<&PortFilter>) -> Result<Option<Self>>
     where
         Self: Sized;
 
@@ -70,18 +106,18 @@ pub trait MTKPort: Send + Debug {
     ) -> Result<Vec<u8>>;
 }
 
-pub async fn find_mtk_port() -> Option<Box<dyn MTKPort>> {
+pub async fn find_mtk_port(filter: Option<&PortFilter>) -> Option<Box<dyn MTKPort>> {
     // Default NUSB backend
     #[cfg(not(any(feature = "libusb", feature = "serial")))]
-    let port = UsbMTKPort::find_device().await;
+    let port = UsbMTKPort::find_device(filter).await;
 
     // LibUSB backend
     #[cfg(feature = "libusb")]
-    let port = UsbMTKPort::find_device().await;
+    let port = UsbMTKPort::find_device(filter).await;
 
     // Serial backend, not ideal since some features (i.e. linecoding) aren't available.
     #[cfg(feature = "serial")]
-    let port = SerialMTKPort::find_device().await;
+    let port = SerialMTKPort::find_device(filter).await;
 
     match port {
         Ok(Some(mut port)) => {

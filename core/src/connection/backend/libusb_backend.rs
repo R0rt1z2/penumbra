@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 
-use crate::connection::port::{ConnectionType, KNOWN_PORTS, MTKPort};
+use crate::connection::port::{ConnectionType, KNOWN_PORTS, MTKPort, PortFilter};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -136,17 +136,9 @@ impl UsbMTKPort {
 
         let handle = tokio::task::block_in_place(|| device.open().ok())?;
 
-        let (in_endpoint, _, out_endpoint, _) =
-            Self::find_bulk_endpoints(&device)?;
+        let (in_endpoint, _, out_endpoint, _) = Self::find_bulk_endpoints(&device)?;
 
-        Some(Self::new(
-            handle,
-            connection_type,
-            port_name,
-            baudrate,
-            in_endpoint,
-            out_endpoint,
-        ))
+        Some(Self::new(handle, connection_type, port_name, baudrate, in_endpoint, out_endpoint))
     }
 }
 
@@ -354,7 +346,7 @@ impl MTKPort for UsbMTKPort {
         self.port_name.clone()
     }
 
-    async fn find_device() -> Result<Option<Self>> {
+    async fn find_device(filter: Option<&PortFilter>) -> Result<Option<Self>> {
         let devices = spawn_blocking(|| -> Result<Vec<Device<Context>>> {
             let context = Context::new()
                 .map_err(|e| Error::io(format!("Failed to create USB context: {:?}", e)))?;
@@ -375,10 +367,30 @@ impl MTKPort for UsbMTKPort {
             let vid = descriptor.vendor_id();
             let pid = descriptor.product_id();
 
-            if KNOWN_PORTS.iter().any(|(kvid, kpid, _)| *kvid == vid && *kpid == pid)
-                && let Some(port) = UsbMTKPort::from_device(device) {
-                    return Ok(Some(port));
+            if let Some(f) = filter {
+                if vid != f.vid || pid != f.pid {
+                    continue;
                 }
+                let conn_type = f.connection_type();
+                let baudrate = match conn_type {
+                    ConnectionType::Brom => 115_200,
+                    ConnectionType::Preloader | ConnectionType::Da => 921_600,
+                };
+                let port_name = format!("USB:{:04x}:{:04x}", vid, pid);
+                let handle = match tokio::task::block_in_place(|| device.open().ok()) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                if let Some((in_ep, _, out_ep, _)) = Self::find_bulk_endpoints(&device) {
+                    return Ok(Some(Self::new(
+                        handle, conn_type, port_name, baudrate, in_ep, out_ep,
+                    )));
+                }
+            } else if KNOWN_PORTS.iter().any(|(kvid, kpid, _)| *kvid == vid && *kpid == pid)
+                && let Some(port) = UsbMTKPort::from_device(device)
+            {
+                return Ok(Some(port));
+            }
         }
 
         Ok(None)
