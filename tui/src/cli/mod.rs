@@ -41,6 +41,9 @@ pub struct CliArgs {
     /// The preloader file to use
     #[arg(short, long = "pl", value_name = "PRELOADER_FILE", global = true)]
     pub preloader_file: Option<PathBuf>,
+    /// The auth file for DAA-enabled devices
+    #[arg(short, long = "auth", value_name = "AUTH_FILE", global = true)]
+    pub auth_file: Option<PathBuf>,
     /// Enable USB DA logging
     #[arg(long = "usb-log", global = true)]
     pub usb_log: bool,
@@ -96,6 +99,13 @@ pub async fn run_cli(args: &CliArgs) -> Result<()> {
         None
     };
 
+    let auth_data = if let Some(auth_path) = &args.auth_file {
+        let data = read(auth_path).await?;
+        Some(data)
+    } else {
+        None
+    };
+
     let mut last_seen = Instant::now();
     let timeout = Duration::from_millis(500);
 
@@ -134,6 +144,7 @@ pub async fn run_cli(args: &CliArgs) -> Result<()> {
     };
 
     builder = if let Some(pl) = pl_data { builder.with_preloader(pl) } else { builder };
+    builder = if let Some(auth) = auth_data { builder.with_auth(auth) } else { builder };
 
     let mut dev = builder.build()?;
 

@@ -48,6 +48,10 @@ pub struct DeviceBuilder {
     /// If provided, it can be used to extract EMI settings or other information.
     /// Only needed if told to do so, like when the device is in BROM mode.
     preloader_data: Option<Vec<u8>>,
+    /// Authentication data for DAA-enabled devices. This field is optional.
+    /// If the device has DAA enabled and is in BROM mode, this data will be
+    /// sent during initialization to authenticate with the device.
+    auth_data: Option<Vec<u8>>,
     /// Whether to enable verbose logging.
     verbose: bool,
     /// Whether to use USB as the DA log channel instead of UART.
@@ -75,6 +79,12 @@ impl DeviceBuilder {
     /// Assigns the preloader data to be used for the device.
     pub fn with_preloader(mut self, data: Vec<u8>) -> Self {
         self.preloader_data = Some(data);
+        self
+    }
+
+    /// Assigns the authentication data for DAA-enabled devices.
+    pub fn with_auth(mut self, data: Vec<u8>) -> Self {
+        self.auth_data = Some(data);
         self
     }
 
@@ -116,6 +126,7 @@ impl DeviceBuilder {
             connected: false,
             da_data: self.da_data,
             preloader_data: self.preloader_data,
+            auth_data: self.auth_data,
             verbose: self.verbose,
             usb_log_channel: self.usb_log_channel,
             device_log,
@@ -147,6 +158,8 @@ pub struct Device {
     da_data: Option<Vec<u8>>,
     /// Preloader data, if provided.
     preloader_data: Option<Vec<u8>>,
+    /// Authentication data for DAA-enabled devices, if provided.
+    auth_data: Option<Vec<u8>>,
     /// Whether verbose logging is enabled.
     verbose: bool,
     /// Whether to log DA messages over USB.
@@ -192,6 +205,15 @@ impl Device {
         }
 
         self.dev_info.set_chip(chip);
+
+        let daa = (target_config & 0x4) != 0;
+        if daa && conn.connection_type == ConnectionType::Brom {
+            if let Some(auth) = &self.auth_data {
+                conn.send_auth(auth)?;
+            } else {
+                warn!("DAA enabled but no auth data provided.");
+            }
+        }
 
         if self.da_data.is_some() {
             self.protocol = Some(self.init_da_protocol(conn)?);

@@ -62,6 +62,10 @@ impl Connection {
         Ok(u32::from_be_bytes(buf))
     }
 
+    fn write_u32_be(&mut self, val: u32) -> Result<()> {
+        self.write(&val.to_be_bytes())
+    }
+
     pub fn check(&self, data: &[u8], expected_data: &[u8]) -> Result<()> {
         if data == expected_data {
             Ok(())
@@ -137,6 +141,46 @@ impl Connection {
             return Err(Error::conn("SendDA data transfer failed"));
         }
 
+        Ok(())
+    }
+
+    pub fn send_auth(&mut self, auth_data: &[u8]) -> Result<()> {
+        let mut data = auth_data.to_vec();
+        if data.len() % 2 != 0 {
+            data.push(0x00);
+        }
+
+        self.echo(&[Command::SendAuth as u8], 1)?;
+
+        let len = data.len() as u32;
+        self.write_u32_be(len)?;
+
+        let rlen = self.read_u32_be()?;
+        if rlen != len {
+            return Err(Error::conn("SendAuth length mismatch"));
+        }
+
+        let status = self.read_u16_be()?;
+        if status == 0x1D0C {
+            info!("No auth needed.");
+            return Ok(());
+        }
+        if status > 0xFF {
+            return Err(Error::conn(format!("SendAuth failed: 0x{:04X}", status)));
+        }
+
+        self.port.write_all(&data)?;
+
+        // Checksum
+        self.read_u16_be()?;
+
+        let final_status = self.read_u16_be()?;
+
+        if final_status > 0xFF {
+            return Err(Error::conn(format!("SendAuth final status: 0x{:04X}", final_status)));
+        }
+
+        info!("Auth sent successfully!");
         Ok(())
     }
 
